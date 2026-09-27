@@ -185,7 +185,7 @@ steps:
   with:
     fetch-depth: 0
 
-- uses: baronunread/leanest@v0.2.6
+- uses: baronunread/leanest@v0.2.7
   with:
     framework: playwright
 ```
