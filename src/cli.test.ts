@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parseFlags, renderReport, reportMarker } from "./cli.js";
+import { explainRuns, parseFlags, renderReport, reportMarker } from "./cli.js";
 import type { SelectionResult, TestCase } from "./types.js";
 
 describe("parseFlags", () => {
@@ -101,6 +101,34 @@ describe("renderReport", () => {
     );
     expect(md).toContain("> Reason: `classifier.dev error (502): <html> 'bad' gateway</html>`");
     expect(md).toContain("| `a\\|b.spec.ts` | RUN | judge unavailable retry |");
+  });
+
+  test("says why the selected tests run, in plain words, in the comment too", () => {
+    const why = (rule: number, judgeUnsure: number, judgeLikely: number) =>
+      explainRuns(result({ runBreakdown: { rule, judgeUnsure, judgeLikely } }));
+    expect(why(2, 9, 1)).toBe(
+      "2 touch the change directly, the judge wasn't sure enough to skip 9 and it thinks 1 is affected.",
+    );
+    expect(why(0, 37, 0)).toBe("The judge wasn't sure enough to skip 37.");
+    expect(why(1, 0, 3)).toBe("1 touches the change directly and the judge thinks 3 are affected.");
+    expect(explainRuns(result({ suiteReason: "runner setup changed (package.json)" }))).toBe(
+      "The only test runs because the runner setup changed (package.json).",
+    );
+    expect(explainRuns(result({ selectedTests: [] }))).toBeNull();
+    expect(explainRuns(result({ selectedTests: [], suiteReason: "only Markdown changed" }))).toBe(
+      "Nothing runs because only Markdown changed.",
+    );
+    const suite = renderReport(
+      "playwright",
+      ".",
+      result({ suiteReason: "runner setup changed (package.json)" }),
+      false,
+    );
+    expect(suite.indexOf("<details><summary>1 test file</summary>")).toBeLessThan(
+      suite.indexOf("| `a.spec.ts` | RUN |"),
+    );
+    const r = result({ runBreakdown: { rule: 1, judgeUnsure: 0, judgeLikely: 0 } });
+    expect(renderReport("playwright", ".", r, false)).toContain("1 touches the change directly.");
   });
 
   test("marker differs per framework and dir, so each run keeps its own comment", () => {
