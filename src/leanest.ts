@@ -6,7 +6,7 @@ import {
 import { ChangeResolver, type GitChange } from "./git-diff.js";
 import { TestDiscovery } from "./test-discovery.js";
 import { ContextBuilder } from "./context-builder.js";
-import { SelectionPolicy } from "./selection-policy.js";
+import { MIN_CONFIDENCE, SelectionPolicy, suiteRule } from "./selection-policy.js";
 import { importsChangedFile } from "./import-graph.js";
 import { touchesSameRoute } from "./route-heuristic.js";
 import type { TestCase, SelectionResult, PipelineResult } from "./types.js";
@@ -22,7 +22,13 @@ export class Leanest {
 
   constructor(cwd?: string, baseRef?: string) {
     this.cwd = cwd ?? ".";
-    this.judge = getProvider();
+    // A bad provider name fails at evaluate(), so it gets the same full-suite fallback
+    // as any other judge failure instead of crashing before a report is written.
+    try {
+      this.judge = getProvider();
+    } catch (error) {
+      this.judge = { name: "unavailable", evaluate: () => Promise.reject(error) };
+    }
     this.git = new ChangeResolver(baseRef, this.cwd);
     this.discovery = new TestDiscovery();
     this.context = new ContextBuilder();
@@ -47,19 +53,33 @@ export class Leanest {
       };
     }
 
+    const suite = this.suiteDecision(discovery.tests, change);
+    if (suite) {
+      return {
+        change,
+        discovered: { framework, count: discovery.tests.length, tests: discovery.tests },
+        evaluated: [],
+        selected: suite.run,
+        skipped: suite.skip.length,
+        decision: "RUN",
+        suiteReason: suite.rule.reason,
+      };
+    }
+
     const state = this.context.buildState(change, discovery.tests);
     const questions = this.buildQuestions(discovery.tests, change.changedFiles.length === 0);
     let answers: Record<string, { probability: number; confidence: number }>;
     try {
       answers = await this.judge.evaluate(state, questions);
-    } catch {
+    } catch (error) {
       return {
         change,
         discovered: { framework, count: discovery.tests.length, tests: discovery.tests },
         evaluated: [],
-        selected: [],
+        selected: discovery.tests,
         skipped: 0,
         decision: "RUN",
+        error: error instanceof Error ? error.message : String(error),
       };
     }
 
@@ -114,6 +134,25 @@ export class Leanest {
       };
     }
 
+    const suite = this.suiteDecision(tests, change);
+    if (suite) {
+      return {
+        command: "select",
+        args: [framework],
+        status: "complete",
+        totalTests: tests.length,
+        selectedTests: suite.run,
+        skippedTests: suite.skip.length,
+        runTests: suite.run,
+        skipped: suite.skip,
+        reasons: suite.reasons,
+        suiteReason: suite.sharedReason,
+        runBreakdown: { rule: suite.run.length, judgeUnsure: 0, judgeLikely: 0 },
+        changedFiles: change.changedFiles,
+        diff: change.diff,
+      };
+    }
+
     const state = this.context.buildState(change, tests);
     const questions = this.buildQuestions(tests, change.changedFiles.length === 0);
     let answers: Record<string, { probability: number; confidence: number }>;
@@ -149,6 +188,7 @@ export class Leanest {
     const runTests: TestCase[] = [];
     const skipTests: TestCase[] = [];
     const reasons: Record<string, string> = {};
+    const runBreakdown = { rule: 0, judgeUnsure: 0, judgeLikely: 0 };
 
     for (const entry of ranked) {
       const deterministic = this.deterministicReason(entry.test, change);
@@ -158,6 +198,9 @@ export class Leanest {
         this.policy.decide(entry.probability, entry.confidence, deterministic !== null) === "RUN"
       ) {
         runTests.push(entry.test);
+        if (deterministic) runBreakdown.rule++;
+        else if (entry.confidence < MIN_CONFIDENCE) runBreakdown.judgeUnsure++;
+        else runBreakdown.judgeLikely++;
       } else {
         skipTests.push(entry.test);
       }
@@ -173,9 +216,30 @@ export class Leanest {
       runTests,
       skipped: skipTests,
       reasons,
+      runBreakdown,
       changedFiles: change.changedFiles,
       diff: change.diff,
     };
+  }
+
+  /**
+   * A whole-suite rule's outcome, or null to ask the judge. A Markdown-only change still runs
+   * the tests a deterministic rule forces, e.g. one that imports the changed .md file.
+   */
+  private suiteDecision(tests: TestCase[], change: GitChange) {
+    const rule = suiteRule(change.changedFiles);
+    if (!rule) return null;
+    const run: TestCase[] = [];
+    const skip: TestCase[] = [];
+    const reasons: Record<string, string> = {};
+    for (const test of tests) {
+      const forced = rule.decision === "SKIP" ? this.deterministicReason(test, change) : null;
+      reasons[test.identity.path] = forced ?? rule.reason;
+      (rule.decision === "RUN" || forced ? run : skip).push(test);
+    }
+    // Only when the rule decided every test does its reason explain the whole selection.
+    const sharedReason = rule.decision === "RUN" || run.length === 0 ? rule.reason : undefined;
+    return { rule, run, skip, reasons, sharedReason };
   }
 
   private deterministicReason(test: TestCase, change: GitChange): string | null {

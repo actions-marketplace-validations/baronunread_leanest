@@ -76,7 +76,7 @@ async function main(): Promise<number> {
       } else {
         printSelect(result);
       }
-      writeStepSummary(command, result, shadow || full);
+      appendReport(renderReport(command, cwd, result, shadow || full));
 
       const paths = result.selectedTests.map((t) => t.identity.path);
       const skippedPaths = result.skipped.map((t) => t.identity.path);
@@ -93,7 +93,7 @@ async function main(): Promise<number> {
             ? "Shadow mode: skipped tests passed, selection missed nothing."
             : "Shadow mode: MISS, skipped tests failed. Selection alone would have let this through.";
         console.log(`\n${verdict}`);
-        appendStepSummary(`\n**${verdict}**\n`);
+        appendReport(`\n**${verdict}**\n`);
         return selectedCode || skippedCode;
       }
 
@@ -165,6 +165,15 @@ function printInspect(result: any): void {
   }
   console.log(`Discovering ${discovered.framework} tests...`);
   console.log(`  ${discovered.count} tests found`);
+  if (result.error) {
+    console.log(
+      `\n⚠ Judge unavailable (${result.error}), all ${discovered.count} tests would run.`,
+    );
+  }
+  if (result.suiteReason) {
+    console.log(`\nNo judge needed: ${result.suiteReason}.`);
+    console.log(`Selected ${result.selected.length} / ${discovered.count} tests`);
+  }
   if (result.evaluated.length > 0) {
     console.log(`\nEvaluating semantic impact...`);
     console.log(`  ${result.evaluated.length} tests evaluated`);
@@ -182,47 +191,128 @@ function printInspect(result: any): void {
   console.log(`\nSkipping ${result.skipped} tests.`);
 }
 
-function printSelect(result: any): void {
+/** One sentence on why the selected tests run, or null when there's nothing to explain. */
+export function explainRuns(result: SelectionResult): string | null {
+  const n = result.selectedTests.length;
+  // Whole-suite rules: "only Markdown changed" skips all, "runner setup changed (…)" runs all.
+  if (n === 0) return result.suiteReason ? `Nothing runs because ${result.suiteReason}.` : null;
+  if (result.suiteReason) {
+    return `${n === 1 ? "The only test runs" : `All ${n} run`} because the ${result.suiteReason}.`;
+  }
+  const b = result.runBreakdown;
+  if (!b) return null;
+  const parts = [
+    b.rule > 0 ? `${b.rule} ${b.rule === 1 ? "touches" : "touch"} the change directly` : "",
+    b.judgeUnsure > 0 ? `the judge wasn't sure enough to skip ${b.judgeUnsure}` : "",
+    b.judgeLikely > 0
+      ? `${b.judgeUnsure > 0 ? "it" : "the judge"} thinks ${b.judgeLikely === 1 ? "1 is" : `${b.judgeLikely} are`} affected`
+      : "",
+  ].filter(Boolean);
+  const sentence =
+    parts.length > 1 ? `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}` : parts[0]!;
+  return `${sentence.charAt(0).toUpperCase()}${sentence.slice(1)}.`;
+}
+
+function printList(lines: string[]): void {
+  for (const line of lines.slice(0, 20)) console.log(`  ${line}`);
+  if (lines.length > 20) console.log(`  ... and ${lines.length - 20} more`);
+}
+
+function printSelect(result: SelectionResult): void {
   const noChanges = result.changedFiles.length === 0;
   if (noChanges && result.totalTests > 0) {
     console.log(`No changes detected.`);
     console.log(`Evaluating all ${result.totalTests} tests conservatively...\n`);
   } else {
     console.log(`Changed:`);
-    for (const f of result.changedFiles.slice(0, 20)) {
-      console.log(`  ${f}`);
-    }
+    printList(result.changedFiles);
     console.log(``);
   }
   console.log(`${result.totalTests} tests found`);
   console.log(`\nSelected ${result.selectedTests.length} / ${result.totalTests} tests`);
-  for (const test of result.selectedTests.slice(0, 20)) {
-    console.log(`  RUN ${test.identity.path}`);
-  }
-  if (result.skippedTests > 0) {
-    console.log(`\nSkipping ${result.skippedTests} tests.`);
-  }
-}
-
-function appendStepSummary(markdown: string): void {
-  const file = process.env.GITHUB_STEP_SUMMARY;
-  if (file) appendFileSync(file, markdown);
-}
-
-function writeStepSummary(command: string, result: SelectionResult, runningAll: boolean): void {
-  const row = (t: TestCase, decision: string) =>
-    `| \`${t.identity.path}\` | ${decision} | ${result.reasons[t.identity.path] ?? ""} |`;
-  appendStepSummary(
-    [
-      `### leanest: ${result.selectedTests.length} of ${result.totalTests} ${command} test files selected`,
-      runningAll ? "\nThe full suite runs anyway (`--shadow` or `--full`).\n" : "",
-      "| Test | Decision | Reason |",
-      "| --- | --- | --- |",
-      ...result.selectedTests.map((t) => row(t, "RUN")),
-      ...result.skipped.map((t) => row(t, "SKIP")),
-      "",
-    ].join("\n"),
+  const why = explainRuns(result);
+  if (why) console.log(why);
+  // A whole-suite rule already said why in one line; don't repeat it per test.
+  printList(
+    result.selectedTests.map((t) =>
+      result.suiteReason
+        ? `RUN ${t.identity.path}`
+        : `RUN ${t.identity.path}  (${result.reasons[t.identity.path]})`,
+    ),
   );
+  if (result.skippedTests > 0) {
+    const n = result.skippedTests;
+    console.log(`\nSkipping ${n} tests.`);
+  }
+}
+
+// Written to the job summary, and to LEANEST_REPORT_FILE for the Action's PR comment.
+function appendReport(markdown: string): void {
+  for (const file of [process.env.GITHUB_STEP_SUMMARY, process.env.LEANEST_REPORT_FILE]) {
+    if (file) appendFileSync(file, markdown);
+  }
+}
+
+/** The Action finds its sticky PR comment by this first line: one comment per framework and dir. */
+export const reportMarker = (command: string, dir: string) =>
+  `<!-- leanest-report ${command} ${dir} -->`;
+
+// Judge errors often carry HTTP response bodies: keep them on one line, inside one code span.
+const inline = (text: string) => text.replace(/\s+/g, " ").replace(/`/g, "'");
+// A table cell also can't hold a bare pipe.
+const cell = (text: string) => inline(text).replace(/\|/g, "\\|");
+
+export function renderReport(
+  command: string,
+  dir: string,
+  result: SelectionResult,
+  runningAll: boolean,
+): string {
+  const row = (t: TestCase, decision: string) =>
+    `| \`${cell(t.identity.path)}\` | ${decision} | ${cell(result.reasons[t.identity.path] ?? "")} |`;
+  const table = (rows: string[]) => [
+    "| Test | Decision | Reason |",
+    "| --- | --- | --- |",
+    ...rows,
+  ];
+  const details = (summary: string, rows: string[]) =>
+    rows.length === 0
+      ? []
+      : [`<details><summary>${summary}</summary>`, "", ...table(rows), "", "</details>", ""];
+  const runRows = result.selectedTests.map((t) => row(t, "RUN"));
+  const skipRows = result.skipped.map((t) => row(t, "SKIP"));
+  const why = explainRuns(result);
+
+  if (result.status === "error") {
+    return [
+      reportMarker(command, dir),
+      `### leanest: all ${result.totalTests} ${command} test files run`,
+      "",
+      "> [!WARNING]",
+      "> **The judge was unavailable, so leanest couldn't select tests and ran the full suite instead.**",
+      `> Reason: \`${inline(result.error ?? "")}\``,
+      ">",
+      "> Nothing was skipped, so this run is as safe as not using leanest. The next run tries the judge again.",
+      "",
+      ...details(`${result.totalTests} test files, all RUN`, runRows),
+    ].join("\n");
+  }
+
+  return [
+    reportMarker(command, dir),
+    `### leanest: ${result.selectedTests.length} of ${result.totalTests} ${command} test files selected`,
+    "",
+    // Under --shadow/--full everything runs, so "Nothing runs because…" would contradict it.
+    ...(why && !runningAll ? [why, ""] : []),
+    ...(runningAll ? ["The full suite runs anyway (`--shadow` or `--full`).", ""] : []),
+    // A whole-suite rule gives every row the same reason, already said above: fold them.
+    ...(result.suiteReason
+      ? details(`${runRows.length} test file${runRows.length === 1 ? "" : "s"}`, runRows)
+      : runRows.length > 0
+        ? [...table(runRows), ""]
+        : []),
+    ...details(`${skipRows.length} skipped`, skipRows),
+  ].join("\n");
 }
 
 function printHelp(): void {

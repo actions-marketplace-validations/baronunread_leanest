@@ -43,6 +43,10 @@ export interface SelectionResult {
   skipped: TestCase[];
   /** Why each test path was run or skipped. */
   reasons: Record<string, string>;
+  /** Why the selected tests run: forced by a rule, the judge too unsure to skip, or judged affected. */
+  runBreakdown?: { rule: number; judgeUnsure: number; judgeLikely: number };
+  /** Set when a whole-suite rule decided every test, e.g. "only Markdown changed". */
+  suiteReason?: string;
   decision?: string;
   changedFiles: string[];
   diff: string;
@@ -59,4 +63,7 @@ export interface PipelineResult {
   selected: TestCase[];
   skipped: number;
   decision: "RUN" | "SKIP";
+  /** Set when the judge failed; every test is then selected. */
+  error?: string /** Set when a whole-suite rule decided instead of the judge. */;
+  suiteReason?: string;
 }
